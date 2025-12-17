@@ -1,0 +1,268 @@
+<script>
+        const DB_KEY = 'wezzy_v6_gif_'; 
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        function resumeAudio() { if (audioCtx.state === 'suspended') audioCtx.resume(); }
+        function playTone(f) { resumeAudio(); const o=audioCtx.createOscillator(), g=audioCtx.createGain(); o.frequency.value=f; g.gain.value=0.03; o.connect(g); g.connect(audioCtx.destination); o.start(); o.stop(audioCtx.currentTime+0.1); }
+        const snd = { click: ()=>playTone(600), msg: ()=>playTone(900), join: ()=>playTone(400) };
+        
+        let peer, myStream, myScreenStream, myName, myAvatar=null, myGif=null, conns=[], isReg=false, muted=true, deaf=true, isInVoice=false, isAdmin=false, serverMuted=false, selUser=null, usersData={};
+        let chatHistory = []; 
+        let isSharingScreen = false;
+        
+        // Зберігаємо ID, до яких ми вже підключені, щоб уникнути дублікатів
+        let connectedPeers = new Set();
+
+        window.onload = function() {
+            const last = localStorage.getItem(DB_KEY + 'last');
+            if(last) {
+                const data = JSON.parse(localStorage.getItem(DB_KEY + last));
+                if(data) {
+                    document.getElementById('login-user').value = last;
+                    document.getElementById('login-pass').value = data.pass;
+                    if(data.ava) { myAvatar = data.ava; myGif = data.gif; updateAvatarPreview(); }
+                }
+            }
+            buildPopups();
+        }
+
+        function processAvatar(input) {
+            const file=input.files[0]; if(!file)return;
+            if (file.size > 1.5 * 1024 * 1024) return alert("Файл занадто великий! Максимум 1.5 МБ.");
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                const result = e.target.result;
+                if(file.type === 'image/gif') {
+                    myAvatar = result; myGif = result; updateAvatarPreview();
+                } else {
+                    const img = new Image(); img.src = result;
+                    img.onload = function() {
+                        const c = document.createElement('canvas'), ctx = c.getContext('2d');
+                        c.width = 120; c.height = 120; ctx.drawImage(img, 0, 0, 120, 120);
+                        myAvatar = c.toDataURL('image/jpeg', 0.7); myGif = null; updateAvatarPreview();
+                    }
+                }
+            }
+            reader.readAsDataURL(file);
+        }
+
+        function updateAvatarPreview() { const img = document.getElementById('avatar-preview'), txt = document.getElementById('avatar-text'); if (myAvatar) { img.src = myAvatar; img.style.display = 'block'; txt.style.display = 'none'; } }
+        function toggleAuth() { snd.click(); isReg=!isReg; document.getElementById('auth-title').innerText = isReg ? "Реєстрація" : "Вхід"; document.getElementById('switch-btn').innerText = isReg ? "Вже є акаунт" : "Створити акаунт"; document.getElementById('auth-action-btn').innerText = isReg ? "Створити" : "Вхід"; }
+        function handleAuth() {
+            snd.click(); const u = document.getElementById('login-user').value.trim(), p = document.getElementById('login-pass').value.trim();
+            if(!u || !p) return alert("Заповніть поля!");
+            const key = DB_KEY + u, saved = localStorage.getItem(key), defAva = "https://cdn.discordapp.com/embed/avatars/0.png";
+            if(isReg) {
+                if(saved) return alert("Зайнято!");
+                localStorage.setItem(key, JSON.stringify({pass:p, ava:myAvatar||defAva, gif:myGif})); localStorage.setItem(DB_KEY+'last', u); myName = u; if(!myAvatar) myAvatar = defAva; enterApp();
+            } else {
+                if(!saved) return alert("Акаунт не знайдено.");
+                const data = JSON.parse(saved); if(data.pass !== p) return alert("Невірний пароль!");
+                myName = u; myAvatar = data.ava; myGif = data.gif; localStorage.setItem(DB_KEY+'last', u); enterApp();
+            }
+        }
+        function enterApp() { document.getElementById('auth-screen').style.display='none'; document.getElementById('connect-screen').style.display='flex'; setupUI(); }
+        function logout() { localStorage.removeItem(DB_KEY+'last'); location.reload(); }
+
+        function initApp(mode) {
+            snd.click(); isAdmin=(mode==='create'); if(isAdmin) document.getElementById('admin-indicator').style.display='block';
+            navigator.mediaDevices.getUserMedia({audio:true}).then(s=>{
+                myStream=s; myStream.getAudioTracks().forEach(t=>t.enabled=false);
+                document.getElementById('connect-screen').style.display='none'; document.getElementById('app-screen').style.display='flex';
+                startPeer(mode==='join'?document.getElementById('room-code').value:null); usersData['me'] = {ava:myAvatar, gif:myGif}; addUserToUI('me', myName, myAvatar);
+            }).catch(e=>alert("Мікрофон не знайдено: "+e));
+        }
+
+        function startPeer(target) {
+            peer=new Peer();
+            peer.on('open', id=>{ 
+                document.getElementById('my-id').innerText=id; 
+                // Якщо ми приєднуємося до когось (target), підключаємось
+                if(target) connectTo(target); 
+            });
+            peer.on('call', call => { 
+                if (call.metadata && call.metadata.type === 'screen') {
+                    call.answer(); 
+                    call.on('stream', screenStream => { addVideoToStage(screenStream, call.peer); });
+                    call.on('close', () => removeVideoFromStage(call.peer));
+                } else {
+                    call.answer(myStream); 
+                    call.on('stream', s => playAudio(s, call.peer)); 
+                    call.on('close', () => removeUser(call.peer)); 
+                    // Додаємо до списку, якщо раптом пропустили 'connection'
+                    connectedPeers.add(call.peer);
+                }
+            });
+            peer.on('connection', c=>{ setupConnection(c); });
+            window.onbeforeunload=()=>peer.destroy();
+        }
+
+        function connectTo(id) {
+            // Перевірка, щоб не підключатися до самого себе або двічі до одного й того ж
+            if(id === peer.id || connectedPeers.has(id)) return;
+            
+            connectedPeers.add(id);
+            
+            const call=peer.call(id, myStream); 
+            call.on('stream', s=>playAudio(s,id)); 
+            call.on('close', ()=>removeUser(id));
+            
+            const c=peer.connect(id); 
+            c.on('open', ()=>c.send({t:'join', name:myName, ava:myAvatar, gif:myGif, adm:isAdmin}));
+            setupConnection(c);
+        }
+
+        function setupConnection(c) {
+            conns.push(c); 
+            c.on('data', d=>handleData(d,c)); 
+            c.on('close', ()=>{ removeUser(c.peer); });
+            connectedPeers.add(c.peer);
+        }
+
+        function handleData(d, c) {
+            if(d.t==='admin-cmd') {
+                if(d.cmd==='force-mute') { serverMuted=true; muted=true; if(isInVoice) myStream.getAudioTracks()[0].enabled=false; document.getElementById('btn-mic').classList.add('off','locked'); alert("Muted by Admin."); }
+                if(d.cmd==='force-unmute') { serverMuted=false; document.getElementById('btn-mic').classList.remove('locked'); alert("Unmuted by Admin."); }
+                if(d.cmd==='kick') { alert("Kicked."); location.reload(); }
+            }
+            if(d.t==='join') { 
+                snd.join(); 
+                usersData[c.peer]={ava:d.ava, gif:d.gif}; 
+                addUserToUI(c.peer,d.name,d.ava,d.adm); 
+                
+                // Відправляємо привіт
+                c.send({t:'welcome',name:myName,ava:myAvatar,gif:myGif,adm:isAdmin});
+                
+                if(isAdmin) {
+                    c.send({t:'history', history: chatHistory});
+                    // !!! ВАЖЛИВО !!! 
+                    // Адмін надсилає новому учаснику список ВСІХ інших учасників
+                    const otherPeers = conns.map(conn => conn.peer).filter(id => id !== c.peer && id !== peer.id);
+                    if(otherPeers.length > 0) {
+                        c.send({t: 'peer-list', peers: otherPeers});
+                    }
+                }
+                if(isSharingScreen && myScreenStream) peer.call(c.peer, myScreenStream, {metadata: {type: 'screen'}});
+            }
+            // Обробка списку пірів (для 3-го, 4-го учасника і т.д.)
+            if(d.t==='peer-list') {
+                d.peers.forEach(id => {
+                    console.log("Connecting to peer from list:", id);
+                    connectTo(id);
+                });
+            }
+
+            if(d.t==='welcome') { usersData[c.peer]={ava:d.ava, gif:d.gif}; addUserToUI(c.peer,d.name,d.ava,d.adm); }
+            if(d.t==='chat') { if(isAdmin) chatHistory.push(d); addMsg(d, false, true); }
+            if(d.t==='history') { d.history.forEach(msg => { addMsg(msg, msg.name === myName, false); }); }
+            if(d.t==='stop-screen') { removeVideoFromStage(c.peer); }
+        }
+
+        function toggleScreenShare() {
+            if (isSharingScreen) { stopScreenShare(); } else {
+                navigator.mediaDevices.getDisplayMedia({ video: true, audio: true }).then(stream => {
+                    isSharingScreen = true; myScreenStream = stream; document.getElementById('btn-screen').classList.add('active');
+                    addVideoToStage(stream, 'me');
+                    conns.forEach(c => { if(c.open) peer.call(c.peer, stream, {metadata: {type: 'screen'}}); });
+                    stream.getVideoTracks()[0].onended = stopScreenShare;
+                }).catch(e => console.log("Screen share cancelled", e));
+            }
+        }
+        function stopScreenShare() {
+            isSharingScreen = false; document.getElementById('btn-screen').classList.remove('active');
+            if (myScreenStream) { myScreenStream.getTracks().forEach(track => track.stop()); myScreenStream = null; }
+            removeVideoFromStage('me');
+            conns.forEach(c => { if(c.open) c.send({t: 'stop-screen'}); });
+        }
+        function addVideoToStage(stream, id) {
+            const stage = document.getElementById('video-stage'); const existing = document.getElementById('vid-'+id); if(existing) existing.remove();
+            const v = document.createElement('video'); v.srcObject = stream; v.id = 'vid-' + id; v.className = 'screen-video'; v.autoplay = true; v.muted = (id === 'me'); 
+            stage.appendChild(v); stage.classList.add('visible');
+        }
+        function removeVideoFromStage(id) { const v = document.getElementById('vid-' + id); if(v) v.remove(); const stage = document.getElementById('video-stage'); if(stage.children.length === 0) stage.classList.remove('visible'); }
+
+        function joinVoice() {
+            snd.click(); isInVoice=true; muted=false; deaf=false;
+            if(serverMuted) { muted=true; document.getElementById('btn-mic').classList.add('off','locked'); }
+            else { document.getElementById('btn-mic').classList.remove('off'); if(myStream) myStream.getAudioTracks()[0].enabled=true; }
+            document.querySelectorAll('audio').forEach(a=>a.muted=false);
+            document.getElementById('voice-join-btn').style.display='none'; document.getElementById('voice-actions').style.display='flex';
+            document.getElementById('btn-deaf').classList.remove('off'); resumeAudio(); monitorAudio(myStream, 'me');
+        }
+        function leaveVoice() {
+            snd.click(); isInVoice=false; muted=true; deaf=true; if(myStream) myStream.getAudioTracks()[0].enabled=false;
+            document.querySelectorAll('audio').forEach(a=>a.muted=true);
+            document.getElementById('voice-actions').style.display='none'; document.getElementById('voice-join-btn').style.display='block';
+            const meEl = document.getElementById('u-me'); if(meEl) meEl.classList.remove('speaking'); if(isSharingScreen) stopScreenShare();
+        }
+        function toggleMic() { if(serverMuted) return; if(deaf) return alert("Увімкніть звук!"); muted=!muted; myStream.getAudioTracks()[0].enabled=!muted; document.getElementById('btn-mic').classList.toggle('off',muted); }
+        function toggleDeaf() { deaf=!deaf; document.querySelectorAll('audio').forEach(a=>a.muted=deaf); document.getElementById('btn-deaf').classList.toggle('off',deaf); if(deaf&&!muted) { muted=true; myStream.getAudioTracks()[0].enabled=false; document.getElementById('btn-mic').classList.add('off'); } }
+
+        function playAudio(s, id) { if(document.getElementById('aud-'+id))return; const a=document.createElement('audio'); a.id='aud-'+id; a.srcObject=s; a.autoplay=true; if(deaf)a.muted=true; document.getElementById('audio-container').appendChild(a); monitorAudio(s,id); }
+
+        function monitorAudio(stream, elementId) {
+            const source = audioCtx.createMediaStreamSource(stream), analyser = audioCtx.createAnalyser(); 
+            source.connect(analyser); analyser.fftSize = 256; const dataArray = new Uint8Array(analyser.frequencyBinCount);
+            let silenceTimer=null, isAnimating=false;
+            const checkVolume = () => {
+                const el = document.getElementById('u-' + elementId), mySidebarImg = document.getElementById('current-user-avatar'); 
+                if (!el && elementId !== 'me') { requestAnimationFrame(checkVolume); return; }
+                analyser.getByteFrequencyData(dataArray);
+                let sum = 0; for(let i=0;i<dataArray.length;i++) sum+=dataArray[i];
+                const isSpeaking = (sum / dataArray.length) > 10; 
+                if (elementId === 'me') {
+                    if(el) { if(isSpeaking && !muted) el.classList.add('speaking'); else el.classList.remove('speaking'); }
+                    if(myAvatar && !myAvatar.startsWith('data:image/gif')) {
+                        if(isSpeaking && !muted && myGif) { mySidebarImg.src = myGif; isAnimating = true; if(silenceTimer) clearTimeout(silenceTimer); }
+                        else if(isAnimating && !silenceTimer) { silenceTimer = setTimeout(()=>{ mySidebarImg.src = myAvatar; isAnimating=false; silenceTimer=null; }, 400); }
+                    }
+                } else {
+                    const img = el.querySelector('.avatar-img'), uData = usersData[elementId];
+                    if (isSpeaking) { el.classList.add('speaking'); if(uData && uData.gif && !uData.ava.startsWith('data:image/gif')) img.src = uData.gif; }
+                    else { el.classList.remove('speaking'); if(uData) img.src = uData.ava; }
+                }
+                requestAnimationFrame(checkVolume);
+            }; checkVolume();
+        }
+
+        function addUserToUI(id,name,ava,isAdm) { if(document.getElementById('u-'+id))return; const l=document.getElementById('user-list'), d=document.createElement('div'); d.className='user-item'; d.id='u-'+id; if(isAdmin && id!=='me') d.oncontextmenu = e => { e.preventDefault(); showCtx(e,id); }; d.innerHTML=`<div class="avatar-wrapper"><img src="${ava}" class="avatar-img"></div><div class="user-name">${name}${isAdm?' <span style="color:#fee75c">👑</span>':''}</div>`; l.appendChild(d); }
+        function removeUser(id) { 
+            const e=document.getElementById('u-'+id); if(e)e.remove(); 
+            removeVideoFromStage(id); 
+            delete usersData[id];
+            connectedPeers.delete(id); // Видаляємо зі списку підключень
+            
+            // Видаляємо з масиву conns
+            conns = conns.filter(c => c.peer !== id);
+        }
+        
+        function checkEnter(e) { if (e.key === 'Enter') sendMsg(); }
+        function sendMsg() { const i=document.getElementById('chat-in'), txt=i.value.trim(); if(!txt)return; const d={t:'chat', name:myName, ava:myAvatar, text:txt, adm:isAdmin}; if(isAdmin) chatHistory.push(d); addMsg(d,true, true); conns.forEach(c=> { if(c.open) c.send(d); }); i.value=''; }
+        function sendGif(u) { const d={t:'chat', name:myName, ava:myAvatar, text:`<img src="${u}" class="chat-gif">`, adm:isAdmin}; if(isAdmin) chatHistory.push(d); addMsg(d,true, true); conns.forEach(c=> { if(c.open) c.send(d); }); togglePopup('gif'); }
+        
+        function addMsg(d, isMe, withSound) {
+            if(!isMe && withSound) snd.msg();
+            const b = document.getElementById('msgs'), div = document.createElement('div'); div.className='msg';
+            div.innerHTML = `<img src="${d.ava}" class="msg-avatar"><div class="msg-content-wrapper"><div class="msg-header"><span class="msg-name">${d.name} ${d.adm?'<span class="admin-crown">👑</span>':''}</span></div><div class="msg-content">${d.text}</div></div>`;
+            b.appendChild(div);
+            const scroll = () => { b.scrollTop = b.scrollHeight; };
+            scroll(); requestAnimationFrame(scroll);
+            const imgs = div.querySelectorAll('img'); imgs.forEach(i => i.onload = scroll);
+        }
+
+        function buildPopups() {
+            const ems = [
+  '😀','😂','🥰','😎','😭','😡','👍','👎','❤️','🔥','💀','🤡','💩','👻',
+  '🎉','✨','🥺','🤔','👀','🙌','💯','🤣','🎂','🎈','🥳','🤯','🥶','🥵',
+  '🤑','🤫','🤥','😬','🤐','🤢','🤮','🤧','😷','🤒','🤕','😈','👿','👹'
+];
+            const ep = document.getElementById('pop-emoji'); ems.forEach(e=>{ let s=document.createElement('span'); s.className='emoji-item'; s.innerText=e; s.onclick=()=>{document.getElementById('chat-in').value+=e; ep.style.display='none'}; ep.appendChild(s); });
+            const gifs = ["https://media.tenor.com/x8v1oNUOmg4AAAAM/rickroll-roll.gif","https://tenor.com/gJfcPaUjgwb.gif","https://tenor.com/bZwvw.gif","https://tenor.com/bVCko.gif","https://tenor.com/WWLP.gif"];
+            const gp = document.getElementById('pop-gif'); gifs.forEach(u=>{ let i=document.createElement('img'); i.className='gif-item'; i.src=u; i.onclick=()=>{sendGif(u); gp.style.display='none'}; gp.appendChild(i); });
+        }
+        function togglePopup(t) { const e = document.getElementById('pop-emoji'), g = document.getElementById('pop-gif'); e.style.display = t==='emoji' && e.style.display==='none' ? 'flex' : 'none'; g.style.display = t==='gif' && g.style.display==='none' ? 'flex' : 'none'; }
+        function showCtx(e,id) { selUser=id; const m=document.getElementById('context-menu'); m.style.display='block'; m.style.left=e.pageX+'px'; m.style.top=e.pageY+'px'; }
+        function hideCtx() { document.getElementById('context-menu').style.display='none'; }
+        function adm(act) { const c=conns.find(x=>x.peer===selUser); if(c) c.send({t:'admin-cmd', cmd:act}); if(act==='kick') removeUser(selUser); hideCtx(); }
+        function setupUI() { document.getElementById('current-user-name').innerText=myName; document.getElementById('current-user-avatar').src=myAvatar; }
+        function copyId() { navigator.clipboard.writeText(document.getElementById('my-id').innerText); alert("ID скопійовано!"); }
+    </script>
